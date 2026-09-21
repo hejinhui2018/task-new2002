@@ -445,3 +445,166 @@ describe('吸头状态：新吸头 / 复用组', () => {
     expect(result.failure?.kind).toBe('invalid');
   });
 });
+
+describe('回归：整孔清空时的样本身份与吸头残留', () => {
+  it('整孔转移恰好清空源孔：下游空孔仍保留样本谱系与全部分析物', () => {
+    const result = simulate([
+      dispense('B1', 100, 100, { kind: 'new' }, 'S1'),
+      transfer('B1', 'B2', 100), // 恰好抽走全部液体
+    ]);
+    expect(result.failure).toBeNull();
+    const plate = result.frames.at(-1)!;
+    expect(plate.B1.volume).toBeCloseTo(0, 9);
+    expect(plate.B1.samples).toEqual([]); // 源孔清空，身份随液体离开
+    expect(plate.B2.samples).toEqual(['S1']); // 修复前这里是 []
+    expect(plate.B2.amount).toBeCloseTo(10000, 9);
+    expect(plate.B2.volume).toBeCloseTo(100, 9);
+    // 空孔受液视为均匀，合法流程不被破坏
+    expect(plate.B2.mixed).toBe(true);
+  });
+
+  it('部分转移保持原行为：来源孔与目标孔都保留谱系', () => {
+    const result = simulate([
+      dispense('C1', 100, 100, { kind: 'new' }, 'S1'),
+      dispense('C2', 100, 0),
+      mix('C1'),
+      transfer('C1', 'C2', 40),
+    ]);
+    expect(result.failure).toBeNull();
+    const plate = result.frames.at(-1)!;
+    expect(plate.C1.volume).toBeCloseTo(60, 9);
+    expect(plate.C1.samples).toEqual(['S1']);
+    expect(plate.C2.samples).toEqual(['S1']);
+  });
+
+  it('整孔弃液恰好清空源孔：复用吸头仍保留该孔的样本残留', () => {
+    const g = { kind: 'reuse' as const, group: 'g' };
+    const result = simulate([
+      dispense('D1', 100, 100, { kind: 'new' }, 'S3'),
+      aspirate('D1', 100, g), // 恰好弃去全部液体
+    ]);
+    expect(result.failure).toBeNull();
+    const plate = result.frames.at(-1)!;
+    expect(plate.D1.volume).toBeCloseTo(0, 9);
+    expect(plate.D1.samples).toEqual([]);
+    const tips = result.tipFrames.at(-1)!;
+    expect(tips.g?.residueSamples).toEqual(['S3']); // 修复前 g 组没有任何记录
+    expect(tips.g?.residueSources).toEqual(['D1']);
+  });
+
+  it('现场场景：复用吸头整孔转移 S1 后进入 S2 孔，必须判跨样本带入', () => {
+    const g = { kind: 'reuse' as const, group: 'G' };
+    const result = simulate([
+      dispense('A1', 100, 100, { kind: 'new' }, 'S1'),
+      transfer('A1', 'A2', 100, g), // 复用吸头把 A1 整孔转到下游 A2
+      dispense('B1', 100, 100, { kind: 'new' }, 'S2'),
+      mix('B1', g), // 再进入另一份样本孔
+    ]);
+    expect(result.failure?.kind).toBe('contamination'); // 修复前为 null（漏报放行）
+    expect(result.failure!.wells[0]).toBe('B1');
+    expect(result.failure!.wells).toContain('A1');
+    expect(result.failure!.message).toContain('S1');
+    // 失败步骤前的帧必须完整保留：整孔转移那一帧下游谱系正确、可回看
+    expect(result.frames.length).toBe(4); // 初始 + 3 个成功步骤，第 4 步失败
+    const afterTransfer = result.frames[2];
+    expect(afterTransfer.A1.volume).toBeCloseTo(0, 9);
+    expect(afterTransfer.A2.samples).toEqual(['S1']);
+    expect(afterTransfer.A2.amount).toBeCloseTo(10000, 9);
+    // 失败步骤不改动任何状态：B1 仍是 100 µL S2
+    const prefixEnd = result.frames.at(-1)!;
+    expect(prefixEnd.B1.volume).toBeCloseTo(100, 9);
+    expect(prefixEnd.B1.samples).toEqual(['S2']);
+  });
+
+  it('现场场景：复用吸头整孔弃液 S3 后进入空孔，同样判污染', () => {
+    const g = { kind: 'reuse' as const, group: 'G' };
+    const result = simulate([
+      dispense('C1', 100, 100, { kind: 'new' }, 'S3'),
+      aspirate('C1', 100, g), // 整孔弃液
+      mix('E7', g), // 空孔
+    ]);
+    expect(result.failure?.kind).toBe('contamination'); // 修复前漏报
+    expect(result.failure!.wells[0]).toBe('E7');
+    expect(result.failure!.wells).toContain('C1');
+  });
+
+  it('残留身份取接触一刻快照：来源孔事后被清空，失败解释仍能指出样本与来源孔', () => {
+    const g = { kind: 'reuse' as const, group: 'G' };
+    const result = simulate([
+      dispense('F1', 100, 100, g, 'S4'),
+      mix('F1', g),
+      aspirate('F1', 10, g),
+      aspirate('F1', 90, g), // F1 在此被整孔清空
+      dispense('F2', 100, 100, { kind: 'new' }, 'S5'),
+      mix('F2', g),
+    ]);
+    expect(result.failure?.kind).toBe('contamination');
+    expect(result.failure!.wells).toEqual(['F2', 'F1']);
+    expect(result.failure!.message).toMatch(/S4/);
+  });
+
+  it('只接触稀释液（含整孔弃液）的复用吸头仍不构成污染', () => {
+    const g = { kind: 'reuse' as const, group: 'buf' };
+    const result = simulate([
+      dispense('H1', 100, 0, g),
+      aspirate('H1', 100, g), // 整孔弃去稀释液
+      dispense('H2', 100, 100, { kind: 'new' }, 'S9'),
+      mix('H2', g),
+    ]);
+    expect(result.failure).toBeNull();
+    // 稀释液接触不留残留；随后接触 S9 才记录
+    const tips = result.tipFrames.at(-1)!;
+    expect(tips.buf?.residueSamples).toEqual(['S9']);
+    expect(tips.buf?.residueSources).toEqual(['H2']);
+  });
+
+  it('连续稀释链上的复用吸头合法流程不回归（部分转移沿链安全）', () => {
+    const g = { kind: 'reuse' as const, group: 'chain' };
+    const result = simulate([
+      dispense('A1', 200, 100, { kind: 'new' }, 'S1'),
+      dispense('A2', 100, 0, { kind: 'new' }),
+      dispense('A3', 100, 0, { kind: 'new' }),
+      mix('A1', g),
+      transfer('A1', 'A2', 100, g),
+      mix('A2', g),
+      transfer('A2', 'A3', 100, g),
+    ]);
+    expect(result.failure).toBeNull();
+    expect(result.frames.at(-1)!.A3.samples).toEqual(['S1']);
+  });
+
+  it('整孔清空后源孔可作为另一身份的容器重新开始，新旧谱系不串', () => {
+    const result = simulate([
+      dispense('G1', 50, 100, { kind: 'new' }, 'S1'),
+      mix('G1'),
+      transfer('G1', 'G2', 50), // G1 清空，液体（含 S1）进入 G2
+      dispense('G1', 80, 25, { kind: 'new' }, 'S2'), // 重新装入 S2
+    ]);
+    expect(result.failure).toBeNull();
+    const plate = result.frames.at(-1)!;
+    expect(plate.G1.samples).toEqual(['S2']);
+    expect(plate.G2.samples).toEqual(['S1']);
+  });
+
+  it('步骤重排：复用吸头在整孔转移“之后”重回已清空的源孔即失败，“之前”则安全', () => {
+    const g = { kind: 'reuse' as const, group: 'G' };
+    const dS1 = dispense('A1', 100, 100, { kind: 'new' }, 'S1');
+    const moveAll = transfer('A1', 'A2', 100, g);
+    const reMixSource = mix('A1', g);
+
+    // 安全顺序：混匀源孔 → 整孔转移（转移时 A1 仍含 S1，与残留同源）
+    const safe = simulate([dS1, reMixSource, moveAll]);
+    expect(safe.failure).toBeNull();
+    expect(safe.frames.at(-1)!.A2.samples).toEqual(['S1']);
+
+    // 危险重排：整孔转移先清空 A1，复用吸头带着 S1 残留重回空 A1 → 污染
+    const unsafe = simulate([dS1, moveAll, reMixSource]);
+    expect(unsafe.failure?.kind).toBe('contamination'); // 修复前因残留丢失而漏报
+    expect(unsafe.failure!.stepIndex).toBe(2);
+    expect(unsafe.failure!.wells[0]).toBe('A1');
+    // 纯函数重算：危险顺序失败前的两帧（含整孔转移帧）都可回看
+    expect(unsafe.frames.length).toBe(3);
+    expect(unsafe.frames[2].A1.volume).toBeCloseTo(0, 9);
+    expect(unsafe.frames[2].A2.samples).toEqual(['S1']);
+  });
+});

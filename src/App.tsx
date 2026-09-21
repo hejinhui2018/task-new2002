@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useEffect, useMemo, useReducer, useRef, useState } from 'react';
 import {
   concentration,
   createDefaultSteps,
@@ -11,8 +11,15 @@ import {
   type WellId,
 } from './engine';
 import { loadSteps, saveSteps } from './state/storage';
+import {
+  canRedo,
+  canUndo,
+  historyReducer,
+  initHistory,
+} from './state/history';
 import { WellPlate } from './components/WellPlate';
 import { StepList } from './components/StepList';
+import { TipResidue } from './components/TipResidue';
 import type { Theme } from './components/colorScale';
 
 const FAILURE_LABEL: Record<FailureKind, string> = {
@@ -71,29 +78,66 @@ function useTheme(): [Theme, () => void] {
 }
 
 export default function App() {
-  const [steps, setSteps] = useState<Step[]>(() => loadSteps());
+  const [history, dispatch] = useReducer(
+    historyReducer,
+    undefined,
+    () => initHistory(loadSteps()),
+  );
+  const steps = history.present;
   const [playhead, setPlayhead] = useState(0);
   const [playing, setPlaying] = useState(false);
   const [theme, toggleTheme] = useTheme();
   const timer = useRef<number | null>(null);
 
-  // 步骤任何增删 / 拖动 / 编辑都从初始板重新整盘仿真，绝不沿用旧结果
+  // 步骤任何增删 / 拖动 / 编辑（含撤销 / 重做）都从初始板重新整盘仿真，绝不沿用旧结果
   const sim = useMemo(() => simulate(steps, createInitialPlate()), [steps]);
 
   useEffect(() => {
     saveSteps(steps);
   }, [steps]);
 
+  // 键盘撤销 / 重做；正在编辑输入框时让浏览器 / 输入框自行处理
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (!(e.ctrlKey || e.metaKey) || e.altKey) return;
+      const el = e.target as HTMLElement | null;
+      if (el && /^(INPUT|TEXTAREA|SELECT)$/.test(el.tagName)) return;
+      const key = e.key.toLowerCase();
+      if (key === 'z' && !e.shiftKey) {
+        e.preventDefault();
+        undo();
+      } else if ((key === 'z' && e.shiftKey) || key === 'y') {
+        e.preventDefault();
+        redo();
+      }
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  });
+
+  const commitSteps = (next: Step[]) => {
+    setPlaying(false);
+    dispatch({ type: 'commit', steps: next });
+  };
+  const undo = () => {
+    setPlaying(false);
+    dispatch({ type: 'undo' });
+  };
+  const redo = () => {
+    setPlaying(false);
+    dispatch({ type: 'redo' });
+  };
+
   const lastFrameIndex = sim.frames.length - 1;
 
-  // 步骤缩短后把播放头收回到有效范围
-  useEffect(() => {
-    setPlayhead((p) => Math.min(p, lastFrameIndex));
-  }, [lastFrameIndex]);
+  // 步骤缩短 / 撤销 / 重做后，播放头可能已越过有效帧。
+  // 必须在渲染期同步收回（而不是 useEffect），否则本次渲染就会取到 undefined 帧。
+  const ph = Math.min(playhead, lastFrameIndex);
+  if (ph !== playhead) setPlayhead(ph);
 
   useEffect(() => {
     if (!playing) return;
-    if (playhead >= lastFrameIndex) {
+    if (ph >= lastFrameIndex) {
       setPlaying(false);
       return;
     }
@@ -101,15 +145,15 @@ export default function App() {
     return () => {
       if (timer.current !== null) window.clearTimeout(timer.current);
     };
-  }, [playing, playhead, lastFrameIndex]);
+  }, [playing, ph, lastFrameIndex]);
 
   const failedIndex = sim.failure?.stepIndex ?? -1;
-  const atFailure = sim.failure !== null && playhead === failedIndex;
-  const allDone = !sim.failure && playhead === lastFrameIndex && lastFrameIndex > 0;
+  const atFailure = sim.failure !== null && ph === failedIndex;
+  const allDone = !sim.failure && ph === lastFrameIndex && lastFrameIndex > 0;
 
-  const currentStep = playhead < steps.length ? steps[playhead] : null;
+  const currentStep = ph < steps.length ? steps[ph] : null;
   const activeWells =
-    currentStep && !atFailure && playhead < lastFrameIndex
+    currentStep && !atFailure && ph < lastFrameIndex
       ? stepWells(currentStep)
       : [];
   const failedWells = atFailure ? sim.failure!.wells : [];
@@ -127,7 +171,9 @@ export default function App() {
   }, [sim]);
 
   // 当前帧的活守恒账
-  const frame = sim.frames[playhead];
+  const frame = sim.frames[ph];
+  // 与当前孔板帧对齐的复用吸头残留快照——污染判定、失败解释与残留面板共用它
+  const frameTips = sim.tipFrames[ph] ?? {};
   const live = useMemo(() => {
     let onV = 0;
     let onA = 0;
@@ -137,38 +183,36 @@ export default function App() {
     }
     let addV = 0;
     let addA = 0;
-    for (const s of steps.slice(0, playhead)) {
+    for (const s of steps.slice(0, ph)) {
       if (s.type === 'dispense') {
         addV += s.volume;
         addA += s.concentration * s.volume;
       }
     }
-    const waste = sim.wasteFrames[playhead] ?? { volume: 0, amount: 0 };
+    const waste = sim.wasteFrames[ph] ?? { volume: 0, amount: 0 };
     const balanced =
       Math.abs(onV + waste.volume - addV) < 1e-6 &&
       Math.abs(onA + waste.amount - addA) < 1e-6;
     return { onV, onA, addV, addA, waste, balanced };
-  }, [frame, steps, playhead, sim.wasteFrames]);
+  }, [frame, steps, ph, sim.wasteFrames]);
 
   const resetProtocol = () => {
     if (!window.confirm('恢复为内置 A1→A8 二倍稀释方案？当前编辑将被替换。')) return;
-    setSteps(createDefaultSteps());
+    commitSteps(createDefaultSteps());
     setPlayhead(0);
-    setPlaying(false);
   };
   const clearAll = () => {
     if (!window.confirm('清空全部步骤？')) return;
-    setSteps([]);
+    commitSteps([]);
     setPlayhead(0);
-    setPlaying(false);
   };
 
   const frameTitle =
-    playhead === 0
+    ph === 0
       ? '初始状态'
       : atFailure
-        ? `第 ${playhead} 步失败：${sim.failure ? FAILURE_LABEL[sim.failure.kind] : ''}`
-        : `第 ${playhead} 步执行后：${stepVerb(steps[playhead - 1])}`;
+        ? `第 ${ph} 步失败：${sim.failure ? FAILURE_LABEL[sim.failure.kind] : ''}`
+        : `第 ${ph} 步执行后：${stepVerb(steps[ph - 1])}`;
 
   return (
     <div className="app">
@@ -178,6 +222,22 @@ export default function App() {
           <div className="subtitle">96 孔板 · 每孔上限 {WELL_CAPACITY_UL} µL · 上机前核对体积、浓度与污染风险</div>
         </div>
         <div className="toolbar">
+          <button
+            className="btn ghost"
+            onClick={undo}
+            disabled={!canUndo(history)}
+            title="撤销上一次步骤编辑（Ctrl/Cmd+Z）"
+          >
+            ↶ 撤销
+          </button>
+          <button
+            className="btn ghost"
+            onClick={redo}
+            disabled={!canRedo(history)}
+            title="重做（Ctrl/Cmd+Shift+Z）"
+          >
+            ↷ 重做
+          </button>
           <button className="btn ghost" onClick={toggleTheme} title="切换明暗主题">
             {theme === 'dark' ? '☀ 浅色' : '🌙 深色'}
           </button>
@@ -211,7 +271,7 @@ export default function App() {
                     setPlaying(false);
                     setPlayhead(0);
                   }}
-                  disabled={playhead === 0}
+                  disabled={ph === 0}
                   title="回到初始状态"
                 >
                   ⏮
@@ -220,16 +280,16 @@ export default function App() {
                   className="btn"
                   onClick={() => {
                     setPlaying(false);
-                    setPlayhead((p) => Math.max(0, p - 1));
+                    setPlayhead(Math.max(0, ph - 1));
                   }}
-                  disabled={playhead === 0}
+                  disabled={ph === 0}
                 >
                   ◀ 单步
                 </button>
                 <button
                   className="btn primary"
                   onClick={() => {
-                    if (playhead >= lastFrameIndex) setPlayhead(0);
+                    if (ph >= lastFrameIndex) setPlayhead(0);
                     setPlaying((p) => !p);
                   }}
                   disabled={lastFrameIndex === 0}
@@ -240,9 +300,9 @@ export default function App() {
                   className="btn"
                   onClick={() => {
                     setPlaying(false);
-                    setPlayhead((p) => Math.min(lastFrameIndex, p + 1));
+                    setPlayhead(Math.min(lastFrameIndex, ph + 1));
                   }}
-                  disabled={playhead >= lastFrameIndex}
+                  disabled={ph >= lastFrameIndex}
                 >
                   单步 ▶
                 </button>
@@ -252,12 +312,12 @@ export default function App() {
                     setPlaying(false);
                     setPlayhead(lastFrameIndex);
                   }}
-                  disabled={playhead >= lastFrameIndex}
+                  disabled={ph >= lastFrameIndex}
                 >
                   ⏭ 到末尾
                 </button>
                 <span className="playhead">
-                  {playhead} / {steps.length} 步
+                  {ph} / {steps.length} 步
                 </span>
               </div>
             </div>
@@ -337,13 +397,19 @@ export default function App() {
             <h2>步骤序列（可拖动排序、点 ✎ 编辑）</h2>
             <StepList
               steps={steps}
-              playhead={playhead}
+              playhead={ph}
               failure={sim.failure}
-              onChange={(next) => {
-                setSteps(next);
-                setPlaying(false);
-              }}
+              onChange={commitSteps}
             />
+          </div>
+
+          <div className="card">
+            <h2>复用吸头残留（当前帧）</h2>
+            <TipResidue tips={frameTips} />
+            <div className="status-line">
+              残留身份在吸头接触含分析物液体的一刻记入；即使来源孔随后被整孔清空，
+              记录仍保留，下一步进入不含该样本的孔即判跨样本带入。
+            </div>
           </div>
 
           <div className="card">

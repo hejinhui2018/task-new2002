@@ -12,10 +12,12 @@ import {
 
 /** 复用组内一支吸头的残留记录 */
 interface Residue {
-  /** 残液中分析物曾经来自的孔 */
-  wells: WellId[];
-  /** 残液中带有的样本标识（样本谱系） */
-  samples: string[];
+  /**
+   * 残液中分析物曾经来自的孔 → 接触该孔时孔内携带的样本身份。
+   * 身份在接触一刻快照下来：之后即使该孔被整孔清空，
+   * 复用吸头检查与失败解释仍能指出残留的来源，而不是回读已清空的板状态。
+   */
+  wellSamples: Map<WellId, string[]>;
 }
 
 interface InternalState {
@@ -57,34 +59,53 @@ function unionSamples(a: string[], b: string[]): string[] {
 /**
  * 判断复用吸头进入某板孔时是否会带入“该孔本不含有”的样本。
  * 连续稀释链下游孔已通过正常受液获得上游样本谱系，不会误报。
+ * 残留的来源身份取自接触一刻的快照，源孔事后被清空也不影响判定与解释。
  */
 function foreignSamples(
   tip: Residue | undefined,
   enteredWell: WellId,
   plate: PlateState,
 ): { samples: string[]; sourceWells: WellId[] } {
-  if (!tip) return { samples: [], sourceWells: [] };
+  if (!tip || tip.wellSamples.size === 0) {
+    return { samples: [], sourceWells: [] };
+  }
   const present = new Set(plate[enteredWell].samples);
-  const samples = tip.samples.filter((s) => !present.has(s));
-  if (samples.length === 0) return { samples: [], sourceWells: [] };
-  const sampleSet = new Set(samples);
-  const sourceWells = tip.wells.filter((w) =>
-    plate[w] ? plate[w].samples.some((s) => sampleSet.has(s)) : true,
-  );
-  return { samples, sourceWells };
+  const foreign = new Set<string>();
+  const sourceWells: WellId[] = [];
+  for (const [well, samples] of tip.wellSamples) {
+    const hit = samples.filter((s) => !present.has(s));
+    if (hit.length > 0) {
+      if (!sourceWells.includes(well)) sourceWells.push(well);
+      for (const s of hit) foreign.add(s);
+    }
+  }
+  return { samples: [...foreign].sort(), sourceWells };
 }
 
-/** 吸头接触含分析物的板孔后，把该孔的样本谱系记入残留 */
+/**
+ * 吸头接触含分析物的板孔后，把接触一刻的样本谱系记入残留。
+ * samples / hasAnalyte 必须取自“接触当时”的液体（转移 / 弃液时在改动来源孔之前
+ * 快照），否则整孔清空后回读孔状态会得到空谱系，残留与下游身份同时丢失。
+ */
 function recordResidue(
   state: InternalState,
   group: string,
   well: WellId,
+  contact?: { samples: string[]; hasAnalyte: boolean },
 ): void {
+  // dispense / mix 不改动孔内样本身份，直接读当前板即可；
+  // transfer / aspirate 必须传入改动来源孔之前的快照。
   const w = state.plate[well];
-  if (w.amount <= EPS) return; // 只接触稀释液，无分析物残留
-  const tip = (state.tips[group] ??= { wells: [], samples: [] });
-  if (!tip.wells.includes(well)) tip.wells.push(well);
-  tip.samples = unionSamples(tip.samples, w.samples);
+  const touched = contact ?? {
+    samples: [...w.samples],
+    hasAnalyte: w.amount > EPS,
+  };
+  if (!touched.hasAnalyte) return; // 只接触稀释液，无分析物残留
+  const tip = (state.tips[group] ??= { wellSamples: new Map() });
+  tip.wellSamples.set(
+    well,
+    unionSamples(tip.wellSamples.get(well) ?? [], touched.samples),
+  );
 }
 
 /**
@@ -115,9 +136,17 @@ export function simulate(
   const snapshotTips = (): Record<string, TipState> => {
     const out: Record<string, TipState> = {};
     for (const [group, tip] of Object.entries(state.tips)) {
+      const residueSources: WellId[] = [];
+      const residueSamples: string[] = [];
+      for (const [well, samples] of tip.wellSamples) {
+        residueSources.push(well);
+        for (const s of samples) {
+          if (!residueSamples.includes(s)) residueSamples.push(s);
+        }
+      }
       out[group] = {
-        residueSources: [...tip.wells],
-        residueSamples: [...tip.samples],
+        residueSources: residueSources.sort(),
+        residueSamples: residueSamples.sort(),
       };
     }
     return out;
@@ -247,7 +276,10 @@ export function simulate(
         failure = fail(
           {
             kind: 'contamination',
-            wells: [enteredWell!, ...sourceWells],
+            wells: [
+              enteredWell!,
+              ...sourceWells.filter((w) => w !== enteredWell),
+            ],
             message:
               `复用吸头（组 ${tipGroup}）残留来自 ${sourceWells.join('、') || '其他孔'} 的样本 ${samples.join(
                 '、',
@@ -315,6 +347,13 @@ export function simulate(
       case 'transfer': {
         const src = state.plate[sourceWell!];
         const dst = state.plate[destWell!];
+        // 吸样一刻的来源身份必须在改动来源孔之前快照：
+        // 恰好清空源孔时，被抽走的整孔液体仍携带着这些样本身份，
+        // 既要随液体并入目标孔谱系，也要留在复用吸头的残留记录里。
+        const contact = {
+          samples: [...src.samples],
+          hasAnalyte: src.amount > EPS,
+        };
         const c = src.volume > 0 ? src.amount / src.volume : 0;
         const drawnAmount = c * drawVolume;
         src.volume -= drawVolume;
@@ -328,13 +367,18 @@ export function simulate(
         const wasEmpty = dst.volume <= EPS;
         dst.volume += drawVolume;
         dst.amount += drawnAmount;
-        dst.samples = unionSamples(dst.samples, src.samples);
+        dst.samples = unionSamples(dst.samples, contact.samples);
         dst.mixed = wasEmpty; // 与孔内旧液合并后必须重新混匀
-        if (isReuse) recordResidue(state, tipGroup, sourceWell!);
+        if (isReuse) recordResidue(state, tipGroup, sourceWell!, contact);
         break;
       }
       case 'aspirate': {
         const src = state.plate[sourceWell!];
+        // 同样在清空来源孔之前快照接触身份，供复用吸头残留判定使用
+        const contact = {
+          samples: [...src.samples],
+          hasAnalyte: src.amount > EPS,
+        };
         const c = src.volume > 0 ? src.amount / src.volume : 0;
         const drawnAmount = c * drawVolume;
         src.volume -= drawVolume;
@@ -346,7 +390,7 @@ export function simulate(
         }
         state.waste.volume += drawVolume;
         state.waste.amount += drawnAmount;
-        if (isReuse) recordResidue(state, tipGroup, sourceWell!);
+        if (isReuse) recordResidue(state, tipGroup, sourceWell!, contact);
         break;
       }
       case 'dispense': {

@@ -106,7 +106,7 @@ function RowFragment({ row, children }: { row: string; children: React.ReactNode
 function wellAria(w: Well): string {
   return `${w.id}：体积 ${w.volume.toFixed(1)} µL，浓度 ${concentration(w).toFixed(4)} µM${
     w.mixed ? '' : '，未混匀'
-  }`;
+  }${w.samples.length ? `，样本谱系 ${w.samples.join('、')}` : ''}`;
 }
 
 function WellTooltip({ well, x, y }: { well: Well; x: number; y: number }) {

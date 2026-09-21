@@ -24,6 +24,8 @@ export type WellId = string; // 形如 "A1" .. "H12"
  * - samples：孔内液体含有的样本标识集合（样本谱系）。
  *   复用吸头带入孔内“本不含有”的样本即判定为跨样本污染；
  *   连续稀释链上的下游孔因正常受液已含有上游样本，不会误报。
+ *   谱系随液体走：转移时按被吸出的液体并入目标孔（即使来源孔被
+ *   恰好抽空）；孔被抽空后体积归零、谱系随之清空（空孔不含样本）。
  */
 export interface Well {
   id: WellId;
@@ -106,6 +108,12 @@ export interface TipState {
   residueSources: WellId[];
   /** 残液中带有的样本标识 */
   residueSamples: string[];
+  /**
+   * 每个残留样本分别由哪些孔带入（接触那一刻记账，不随后续孔状态
+   * 变化）。污染失败解释中的“残留来源孔”即取自本表，保证与吸头
+   * 实际携带的残留是同一份状态。
+   */
+  residueSampleSources: Record<string, WellId[]>;
 }
 
 /** 质量守恒账：板上 + 废液 = 初始 + 储液池加入 */
